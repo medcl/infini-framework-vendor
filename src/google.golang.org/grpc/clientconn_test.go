@@ -33,7 +33,6 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/envconfig"
-	"google.golang.org/grpc/internal/leakcheck"
 	"google.golang.org/grpc/internal/transport"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/naming"
@@ -62,74 +61,60 @@ func assertState(wantState connectivity.State, cc *ClientConn) (connectivity.Sta
 	return state, state == wantState
 }
 
-func TestDialWithMultipleBackendsNotSendingServerPreface(t *testing.T) {
-	defer leakcheck.Check(t)
-	numServers := 2
-	servers := make([]net.Listener, numServers)
-	var err error
-	for i := 0; i < numServers; i++ {
-		servers[i], err = net.Listen("tcp", "localhost:0")
+func (s) TestDialWithMultipleBackendsNotSendingServerPreface(t *testing.T) {
+	lis1, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error while listening. Err: %v", err)
+	}
+	defer lis1.Close()
+	lis1Addr := resolver.Address{Addr: lis1.Addr().String()}
+	lis1Done := make(chan struct{})
+	// 1st listener accepts the connection and immediately closes it.
+	go func() {
+		defer close(lis1Done)
+		conn, err := lis1.Accept()
 		if err != nil {
-			t.Fatalf("Error while listening. Err: %v", err)
+			t.Errorf("Error while accepting. Err: %v", err)
+			return
 		}
+		conn.Close()
+	}()
+
+	lis2, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error while listening. Err: %v", err)
 	}
-	dones := make([]chan struct{}, numServers)
-	for i := 0; i < numServers; i++ {
-		dones[i] = make(chan struct{})
-	}
-	for i := 0; i < numServers; i++ {
-		go func(i int) {
-			defer func() {
-				close(dones[i])
-			}()
-			conn, err := servers[i].Accept()
-			if err != nil {
-				t.Errorf("Error while accepting. Err: %v", err)
-				return
-			}
-			defer conn.Close()
-			switch i {
-			case 0: // 1st server accepts the connection and immediately closes it.
-			case 1: // 2nd server accepts the connection and sends settings frames.
-				framer := http2.NewFramer(conn, conn)
-				if err := framer.WriteSettings(http2.Setting{}); err != nil {
-					t.Errorf("Error while writing settings frame. %v", err)
-					return
-				}
-				conn.SetDeadline(time.Now().Add(time.Second))
-				buf := make([]byte, 1024)
-				for { // Make sure the connection stays healthy.
-					_, err = conn.Read(buf)
-					if err == nil {
-						continue
-					}
-					if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
-						t.Errorf("Server expected the conn.Read(_) to timeout instead got error: %v", err)
-					}
-					return
-				}
-			}
-		}(i)
-	}
+	defer lis2.Close()
+	lis2Done := make(chan struct{})
+	lis2Addr := resolver.Address{Addr: lis2.Addr().String()}
+	// 2nd listener should get a connection attempt since the first one failed.
+	go func() {
+		defer close(lis2Done)
+		_, err := lis2.Accept() // Closing the client will clean up this conn.
+		if err != nil {
+			t.Errorf("Error while accepting. Err: %v", err)
+			return
+		}
+	}()
+
 	r, cleanup := manual.GenerateAndRegisterManualResolver()
 	defer cleanup()
-	resolvedAddrs := make([]resolver.Address, numServers)
-	for i := 0; i < numServers; i++ {
-		resolvedAddrs[i] = resolver.Address{Addr: servers[i].Addr().String()}
-	}
-	r.InitialAddrs(resolvedAddrs)
+	r.InitialAddrs([]resolver.Address{lis1Addr, lis2Addr})
 	client, err := Dial(r.Scheme()+":///test.server", WithInsecure())
 	if err != nil {
-		t.Errorf("Dial failed. Err: %v", err)
-	} else {
-		defer client.Close()
+		t.Fatalf("Dial failed. Err: %v", err)
 	}
-	time.Sleep(time.Second) // Close the servers after a second for cleanup.
-	for _, s := range servers {
-		s.Close()
+	defer client.Close()
+	timeout := time.After(5 * time.Second)
+	select {
+	case <-timeout:
+		t.Fatal("timed out waiting for server 1 to finish")
+	case <-lis1Done:
 	}
-	for _, done := range dones {
-		<-done
+	select {
+	case <-timeout:
+		t.Fatal("timed out waiting for server 2 to finish")
+	case <-lis2Done:
 	}
 }
 
@@ -147,12 +132,10 @@ var reqHSBeforeSuccess = []envconfig.RequireHandshakeSetting{
 	envconfig.RequireHandshakeHybrid,
 }
 
-func TestDialWaitsForServerSettings(t *testing.T) {
+func (s) TestDialWaitsForServerSettings(t *testing.T) {
 	// Restore current setting after test.
 	old := envconfig.RequireHandshake
 	defer func() { envconfig.RequireHandshake = old }()
-
-	defer leakcheck.Check(t)
 
 	// Test with all environment variable settings, which should not impact the
 	// test case since WithWaitForHandshake has higher priority.
@@ -204,13 +187,11 @@ func TestDialWaitsForServerSettings(t *testing.T) {
 	}
 }
 
-func TestDialWaitsForServerSettingsViaEnv(t *testing.T) {
+func (s) TestDialWaitsForServerSettingsViaEnv(t *testing.T) {
 	// Set default behavior and restore current setting after test.
 	old := envconfig.RequireHandshake
 	envconfig.RequireHandshake = envconfig.RequireHandshakeOn
 	defer func() { envconfig.RequireHandshake = old }()
-
-	defer leakcheck.Check(t)
 
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -257,12 +238,10 @@ func TestDialWaitsForServerSettingsViaEnv(t *testing.T) {
 	<-done
 }
 
-func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
+func (s) TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 	// Restore current setting after test.
 	old := envconfig.RequireHandshake
 	defer func() { envconfig.RequireHandshake = old }()
-
-	defer leakcheck.Check(t)
 
 	for _, setting := range allReqHSSettings {
 		envconfig.RequireHandshake = setting
@@ -305,13 +284,11 @@ func TestDialWaitsForServerSettingsAndFails(t *testing.T) {
 	}
 }
 
-func TestDialWaitsForServerSettingsViaEnvAndFails(t *testing.T) {
+func (s) TestDialWaitsForServerSettingsViaEnvAndFails(t *testing.T) {
 	// Set default behavior and restore current setting after test.
 	old := envconfig.RequireHandshake
 	envconfig.RequireHandshake = envconfig.RequireHandshakeOn
 	defer func() { envconfig.RequireHandshake = old }()
-
-	defer leakcheck.Check(t)
 
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -351,12 +328,10 @@ func TestDialWaitsForServerSettingsViaEnvAndFails(t *testing.T) {
 	<-done
 }
 
-func TestDialDoesNotWaitForServerSettings(t *testing.T) {
+func (s) TestDialDoesNotWaitForServerSettings(t *testing.T) {
 	// Restore current setting after test.
 	old := envconfig.RequireHandshake
 	defer func() { envconfig.RequireHandshake = old }()
-
-	defer leakcheck.Check(t)
 
 	// Test with "off" and "hybrid".
 	for _, setting := range reqNoHSSettings {
@@ -397,7 +372,7 @@ func TestDialDoesNotWaitForServerSettings(t *testing.T) {
 	}
 }
 
-func TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
+func (s) TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 	// Restore current setting after test.
 	old := envconfig.RequireHandshake
 	defer func() { envconfig.RequireHandshake = old }()
@@ -406,7 +381,6 @@ func TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 	// 2. After minConnectTimeout(500 ms here), client disconnects and retries.
 	// 3. The new server sends its preface.
 	// 4. Client doesn't kill the connection this time.
-	defer leakcheck.Check(t)
 	cleanup := setMinConnectTimeout(time.Millisecond * 500)
 	defer cleanup()
 
@@ -486,8 +460,7 @@ func TestCloseConnectionWhenServerPrefaceNotReceived(t *testing.T) {
 	}
 }
 
-func TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Error while listening. Err: %v", err)
@@ -533,8 +506,7 @@ func TestBackoffWhenNoServerPrefaceReceived(t *testing.T) {
 
 }
 
-func TestConnectivityStates(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestConnectivityStates(t *testing.T) {
 	servers, resolver, cleanup := startServers(t, 2, math.MaxUint32)
 	defer cleanup()
 	cc, err := Dial("passthrough:///foo.bar.com", WithBalancer(RoundRobin(resolver)), WithInsecure())
@@ -570,8 +542,7 @@ func TestConnectivityStates(t *testing.T) {
 
 }
 
-func TestWithTimeout(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestWithTimeout(t *testing.T) {
 	conn, err := Dial("passthrough:///Non-Existent.Server:80", WithTimeout(time.Millisecond), WithBlock(), WithInsecure())
 	if err == nil {
 		conn.Close()
@@ -581,10 +552,9 @@ func TestWithTimeout(t *testing.T) {
 	}
 }
 
-func TestWithTransportCredentialsTLS(t *testing.T) {
+func (s) TestWithTransportCredentialsTLS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	defer leakcheck.Check(t)
 	creds, err := credentials.NewClientTLSFromFile(testdata.Path("ca.pem"), "x.test.youtube.com")
 	if err != nil {
 		t.Fatalf("Failed to create credentials %v", err)
@@ -598,8 +568,7 @@ func TestWithTransportCredentialsTLS(t *testing.T) {
 	}
 }
 
-func TestDefaultAuthority(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestDefaultAuthority(t *testing.T) {
 	target := "Non-Existent.Server:8080"
 	conn, err := Dial(target, WithInsecure())
 	if err != nil {
@@ -611,8 +580,7 @@ func TestDefaultAuthority(t *testing.T) {
 	}
 }
 
-func TestTLSServerNameOverwrite(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestTLSServerNameOverwrite(t *testing.T) {
 	overwriteServerName := "over.write.server.name"
 	creds, err := credentials.NewClientTLSFromFile(testdata.Path("ca.pem"), overwriteServerName)
 	if err != nil {
@@ -628,8 +596,7 @@ func TestTLSServerNameOverwrite(t *testing.T) {
 	}
 }
 
-func TestWithAuthority(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestWithAuthority(t *testing.T) {
 	overwriteServerName := "over.write.server.name"
 	conn, err := Dial("passthrough:///Non-Existent.Server:80", WithInsecure(), WithAuthority(overwriteServerName))
 	if err != nil {
@@ -641,8 +608,7 @@ func TestWithAuthority(t *testing.T) {
 	}
 }
 
-func TestWithAuthorityAndTLS(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestWithAuthorityAndTLS(t *testing.T) {
 	overwriteServerName := "over.write.server.name"
 	creds, err := credentials.NewClientTLSFromFile(testdata.Path("ca.pem"), overwriteServerName)
 	if err != nil {
@@ -658,8 +624,7 @@ func TestWithAuthorityAndTLS(t *testing.T) {
 	}
 }
 
-func TestDialContextCancel(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestDialContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := DialContext(ctx, "Non-Existent.Server:80", WithBlock(), WithInsecure()); err != context.Canceled {
@@ -672,8 +637,7 @@ type failFastError struct{}
 func (failFastError) Error() string   { return "failfast" }
 func (failFastError) Temporary() bool { return false }
 
-func TestDialContextFailFast(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestDialContextFailFast(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	failErr := failFastError{}
@@ -713,8 +677,7 @@ func (b *blockingBalancer) Close() error {
 	return nil
 }
 
-func TestDialWithBlockingBalancer(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestDialWithBlockingBalancer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dialDone := make(chan struct{})
 	go func() {
@@ -736,8 +699,7 @@ func (c securePerRPCCredentials) RequireTransportSecurity() bool {
 	return true
 }
 
-func TestCredentialsMisuse(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestCredentialsMisuse(t *testing.T) {
 	tlsCreds, err := credentials.NewClientTLSFromFile(testdata.Path("ca.pem"), "x.test.youtube.com")
 	if err != nil {
 		t.Fatalf("Failed to create authenticator %v", err)
@@ -752,20 +714,17 @@ func TestCredentialsMisuse(t *testing.T) {
 	}
 }
 
-func TestWithBackoffConfigDefault(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestWithBackoffConfigDefault(t *testing.T) {
 	testBackoffConfigSet(t, &DefaultBackoffConfig)
 }
 
-func TestWithBackoffConfig(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestWithBackoffConfig(t *testing.T) {
 	b := BackoffConfig{MaxDelay: DefaultBackoffConfig.MaxDelay / 2}
 	expected := b
 	testBackoffConfigSet(t, &expected, WithBackoffConfig(b))
 }
 
-func TestWithBackoffMaxDelay(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestWithBackoffMaxDelay(t *testing.T) {
 	md := DefaultBackoffConfig.MaxDelay / 2
 	expected := BackoffConfig{MaxDelay: md}
 	testBackoffConfigSet(t, &expected, WithBackoffMaxDelay(md))
@@ -822,8 +781,7 @@ func (b *emptyBalancer) Close() error {
 	return nil
 }
 
-func TestNonblockingDialWithEmptyBalancer(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestNonblockingDialWithEmptyBalancer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	dialDone := make(chan error)
@@ -841,8 +799,7 @@ func TestNonblockingDialWithEmptyBalancer(t *testing.T) {
 	}
 }
 
-func TestResolverServiceConfigBeforeAddressNotPanic(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestResolverServiceConfigBeforeAddressNotPanic(t *testing.T) {
 	r, rcleanup := manual.GenerateAndRegisterManualResolver()
 	defer rcleanup()
 
@@ -859,8 +816,7 @@ func TestResolverServiceConfigBeforeAddressNotPanic(t *testing.T) {
 	time.Sleep(time.Second) // Sleep to make sure the service config is handled by ClientConn.
 }
 
-func TestResolverServiceConfigWhileClosingNotPanic(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestResolverServiceConfigWhileClosingNotPanic(t *testing.T) {
 	for i := 0; i < 10; i++ { // Run this multiple times to make sure it doesn't panic.
 		r, rcleanup := manual.GenerateAndRegisterManualResolver()
 		defer rcleanup()
@@ -875,8 +831,7 @@ func TestResolverServiceConfigWhileClosingNotPanic(t *testing.T) {
 	}
 }
 
-func TestResolverEmptyUpdateNotPanic(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestResolverEmptyUpdateNotPanic(t *testing.T) {
 	r, rcleanup := manual.GenerateAndRegisterManualResolver()
 	defer rcleanup()
 
@@ -892,8 +847,7 @@ func TestResolverEmptyUpdateNotPanic(t *testing.T) {
 	time.Sleep(time.Second) // Sleep to make sure the service config is handled by ClientConn.
 }
 
-func TestClientUpdatesParamsAfterGoAway(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestClientUpdatesParamsAfterGoAway(t *testing.T) {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Failed to listen. Err: %v", err)
@@ -921,7 +875,7 @@ func TestClientUpdatesParamsAfterGoAway(t *testing.T) {
 	}
 }
 
-func TestDisableServiceConfigOption(t *testing.T) {
+func (s) TestDisableServiceConfigOption(t *testing.T) {
 	r, cleanup := manual.GenerateAndRegisterManualResolver()
 	defer cleanup()
 	addr := r.Scheme() + ":///non.existent"
@@ -950,7 +904,7 @@ func TestDisableServiceConfigOption(t *testing.T) {
 	}
 }
 
-func TestGetClientConnTarget(t *testing.T) {
+func (s) TestGetClientConnTarget(t *testing.T) {
 	addr := "nonexist:///non.existent"
 	cc, err := Dial(addr, WithInsecure())
 	if err != nil {
@@ -966,8 +920,7 @@ type backoffForever struct{}
 
 func (b backoffForever) Backoff(int) time.Duration { return time.Duration(math.MaxInt64) }
 
-func TestResetConnectBackoff(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestResetConnectBackoff(t *testing.T) {
 	dials := make(chan struct{})
 	defer func() { // If we fail, let the http2client break out of dialing.
 		select {
@@ -1005,8 +958,7 @@ func TestResetConnectBackoff(t *testing.T) {
 	}
 }
 
-func TestBackoffCancel(t *testing.T) {
-	defer leakcheck.Check(t)
+func (s) TestBackoffCancel(t *testing.T) {
 	dialStrCh := make(chan string)
 	cc, err := Dial("any", WithInsecure(), WithDialer(func(t string, _ time.Duration) (net.Conn, error) {
 		dialStrCh <- t
@@ -1022,7 +974,7 @@ func TestBackoffCancel(t *testing.T) {
 
 // UpdateAddresses should cause the next reconnect to begin from the top of the
 // list if the connection is not READY.
-func TestUpdateAddresses_RetryFromFirstAddr(t *testing.T) {
+func (s) TestUpdateAddresses_RetryFromFirstAddr(t *testing.T) {
 	cleanup := setMinConnectTimeout(time.Hour)
 	defer cleanup()
 
