@@ -205,7 +205,13 @@ func (b *builder) generate() {
 	b.setData("lang", func(g *group, loc language.Tag, ldn *cldr.LocaleDisplayNames) {
 		if ldn.Languages != nil {
 			for _, v := range ldn.Languages.Language {
-				tag := tagForm.MustParse(v.Type)
+				lang := v.Type
+				if lang == "root" {
+					// We prefer the data from "und"
+					// TODO: allow both the data for root and und somehow.
+					continue
+				}
+				tag := tagForm.MustParse(lang)
 				if tags.contains(tag) {
 					g.set(loc, tag.String(), v.Data())
 				}
@@ -360,7 +366,7 @@ func (b *builder) filter() {
 func (b *builder) makeSupported() {
 	// tags across groups
 	for _, g := range b.group {
-		for t := range g.lang {
+		for t, _ := range g.lang {
 			b.supported = append(b.supported, t)
 		}
 	}
@@ -378,7 +384,7 @@ func (b *builder) writeGroup(name string) {
 	g := b.group[name]
 
 	for _, kv := range g.lang {
-		for t := range kv {
+		for t, _ := range kv {
 			g.toTags = append(g.toTags, t)
 		}
 	}
@@ -408,7 +414,7 @@ func (b *builder) writeGroup(name string) {
 		index = index[:n]
 
 		// Workaround for a bug in CLDR 26.
-		// See http://unicode.org/cldr/trac/ticket/8042.
+		// See https://unicode.org/cldr/trac/ticket/8042.
 		if cldr.Version == "26" && sup.String() == "hsb" {
 			data = bytes.Replace(data, []byte{'"'}, nil, 1)
 		}

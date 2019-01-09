@@ -35,7 +35,7 @@ func genTables() {
 	// fold and inverse mappings. See mapComment for a description of the format
 	// of each entry. Add dummy value to make an index of 0 mean no mapping.
 	inverse := [][4]byte{{}}
-	mapping := map[[4]byte]int{{}: 0}
+	mapping := map[[4]byte]int{[4]byte{}: 0}
 
 	getWidthData(func(r rune, tag elem, alt rune) {
 		idx := 0
@@ -69,7 +69,7 @@ func genTables() {
 
 	fmt.Fprintf(w, "// Total table size %d bytes (%dKiB)\n", sz, sz/1024)
 
-	gen.WriteGoFile(*outputFile, "width", w.Bytes())
+	gen.WriteVersionedGoFile(*outputFile, "width", w.Bytes())
 }
 
 const inverseDataComment = `
