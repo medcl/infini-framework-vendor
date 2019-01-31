@@ -16,7 +16,8 @@
 //
 
 package cld2_nlpt
-
+// #cgo LDFLAGS: -lstdc++
+// #cgo CXXFLAGS: -std=c++98
 // #include <stdlib.h>
 // #include "cld2_nlpt.h"
 import "C"
